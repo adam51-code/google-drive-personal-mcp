@@ -1,0 +1,11 @@
+name = "google-drive-personal-mcp"
+main = "src/index.js"
+compatibility_date = "2026-09-20"
+
+[[kv_namespaces]]
+binding = "GOOGLE_TOKENS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[vars]
+GOOGLE_API_BASE = "https://www.googleapis.com"
+GOOGLE_REDIRECT_URI = "https://google-drive-personal-mcp.adam-efc.workers.dev/callback"
