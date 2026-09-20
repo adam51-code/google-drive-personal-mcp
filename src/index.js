@@ -66,7 +66,7 @@ const TOOLS = [
   },
   {
     name: "drive_upload",
-    description: "Upload a new file to Google Drive. Provide content as base64 or plain text.",
+    description: "Upload a new file to Google Drive. For small files (under 100KB base64). For larger files, use drive_upload_start/part/complete.",
     inputSchema: {
       type: "object",
       properties: {
@@ -77,6 +77,44 @@ const TOOLS = [
         folder_id: { type: "string", description: "Target folder ID. Omit for root.", default: "root" }
       },
       required: ["name", "content"]
+    }
+  },
+  {
+    name: "drive_upload_start",
+    description: "Start a chunked upload for large files. Returns an upload_id. Then call drive_upload_part one or more times with base64 chunks (up to 200KB each), then drive_upload_complete to finish.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "File name including extension." },
+        mime_type: { type: "string", description: "MIME type of the file.", default: "application/octet-stream" },
+        folder_id: { type: "string", description: "Target folder ID. Omit for root.", default: "root" }
+      },
+      required: ["name"]
+    }
+  },
+  {
+    name: "drive_upload_part",
+    description: "Upload a base64 chunk for an in-progress chunked upload. Call multiple times in order. Each chunk should be up to 200KB of base64 text.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        upload_id: { type: "string", description: "The upload_id from drive_upload_start." },
+        part_number: { type: "number", description: "Sequential part number starting at 1." },
+        content: { type: "string", description: "Base64-encoded chunk of the file." }
+      },
+      required: ["upload_id", "part_number", "content"]
+    }
+  },
+  {
+    name: "drive_upload_complete",
+    description: "Complete a chunked upload. Assembles all parts and uploads the file to Google Drive.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        upload_id: { type: "string", description: "The upload_id from drive_upload_start." },
+        total_parts: { type: "number", description: "Total number of parts uploaded." }
+      },
+      required: ["upload_id", "total_parts"]
     }
   },
   {
@@ -336,6 +374,70 @@ async function handleTool(name, args, env) {
         body: body
       });
       return await res.json();
+    }
+    case "drive_upload_start": {
+      const uploadId = "upload_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+      const meta = {
+        name: args.name,
+        mime_type: args.mime_type || "application/octet-stream",
+        folder_id: args.folder_id || "root",
+        created: Date.now(),
+        parts: 0
+      };
+      await env.GOOGLE_TOKENS.put(`chunked:${uploadId}:meta`, JSON.stringify(meta), { expirationTtl: 3600 });
+      return { upload_id: uploadId, status: "ready", message: "Upload initialized. Send chunks with drive_upload_part, then call drive_upload_complete." };
+    }
+    case "drive_upload_part": {
+      const metaRaw = await env.GOOGLE_TOKENS.get(`chunked:${args.upload_id}:meta`);
+      if (!metaRaw) throw new Error("Upload not found or expired. Start a new upload with drive_upload_start.");
+      const meta = JSON.parse(metaRaw);
+      await env.GOOGLE_TOKENS.put(`chunked:${args.upload_id}:part_${args.part_number}`, args.content, { expirationTtl: 3600 });
+      meta.parts = Math.max(meta.parts, args.part_number);
+      await env.GOOGLE_TOKENS.put(`chunked:${args.upload_id}:meta`, JSON.stringify(meta), { expirationTtl: 3600 });
+      return { upload_id: args.upload_id, part_number: args.part_number, status: "stored", total_parts_so_far: meta.parts };
+    }
+    case "drive_upload_complete": {
+      const metaRaw = await env.GOOGLE_TOKENS.get(`chunked:${args.upload_id}:meta`);
+      if (!metaRaw) throw new Error("Upload not found or expired.");
+      const meta = JSON.parse(metaRaw);
+      let allBase64 = "";
+      for (let i = 1; i <= args.total_parts; i++) {
+        const chunk = await env.GOOGLE_TOKENS.get(`chunked:${args.upload_id}:part_${i}`);
+        if (!chunk) throw new Error(`Missing part ${i}. Upload all parts before completing.`);
+        allBase64 += chunk;
+      }
+      const binaryString = atob(allBase64);
+      const fileBytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) fileBytes[i] = binaryString.charCodeAt(i);
+      const boundary = "mcp_boundary_" + Date.now();
+      const metadata = JSON.stringify({ name: meta.name, parents: [meta.folder_id] });
+      const mimeType = meta.mime_type;
+      const partStrings = [
+        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n`,
+        `--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`
+      ];
+      const prefix = new TextEncoder().encode(partStrings[0] + partStrings[1]);
+      const suffix = new TextEncoder().encode(`\r\n--${boundary}--`);
+      const body = new Uint8Array(prefix.length + fileBytes.length + suffix.length);
+      body.set(prefix, 0);
+      body.set(fileBytes, prefix.length);
+      body.set(suffix, prefix.length + fileBytes.length);
+      const token = await refreshAccessToken(env);
+      const res = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,webViewLink,size", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": `multipart/related; boundary=${boundary}`
+        },
+        body: body
+      });
+      const result = await res.json();
+      // Clean up KV
+      await env.GOOGLE_TOKENS.delete(`chunked:${args.upload_id}:meta`);
+      for (let i = 1; i <= args.total_parts; i++) {
+        await env.GOOGLE_TOKENS.delete(`chunked:${args.upload_id}:part_${i}`);
+      }
+      return { ...result, upload_id: args.upload_id, status: "complete", parts_assembled: args.total_parts };
     }
     case "drive_update": {
       const boundary = "mcp_boundary_" + Date.now();
