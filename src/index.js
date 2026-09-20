@@ -1,6 +1,6 @@
 // ============================================================
 // Google Drive Personal MCP Server
-// Cloudflare Worker — zero dependencies, pure JavaScript
+// Cloudflare Worker – zero dependencies, pure JavaScript
 // ============================================================
 
 const TOOLS = [
@@ -66,7 +66,7 @@ const TOOLS = [
   },
   {
     name: "drive_upload",
-    description: "Upload a new file to Google Drive. For small files (under 100KB base64). For larger files, use drive_upload_start/part/complete.",
+    description: "Upload a new file to Google Drive from text or small base64 content (under 100KB). For larger or binary files, use drive_upload_file with a URL instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -80,41 +80,17 @@ const TOOLS = [
     }
   },
   {
-    name: "drive_upload_start",
-    description: "Start a chunked upload for large files. Returns an upload_id. Then call drive_upload_part one or more times with base64 chunks (up to 200KB each), then drive_upload_complete to finish.",
+    name: "drive_upload_file",
+    description: "Upload a file to Google Drive from a URL. Fetches the file from the provided URL server-side and uploads it to Drive. Works for PDFs, images, videos, any file. Use this for ClickUp attachments, web images, direct download links, or any publicly accessible URL.",
     inputSchema: {
       type: "object",
       properties: {
-        name: { type: "string", description: "File name including extension." },
-        mime_type: { type: "string", description: "MIME type of the file.", default: "application/octet-stream" },
-        folder_id: { type: "string", description: "Target folder ID. Omit for root.", default: "root" }
+        url: { type: "string", description: "Public URL of the file to fetch and upload (e.g. a ClickUp attachment URL, a direct download link)." },
+        name: { type: "string", description: "Filename for the uploaded file in Drive (e.g. 'receipt.pdf')." },
+        mime_type: { type: "string", description: "MIME type of the file (e.g. 'application/pdf', 'image/jpeg'). Auto-detected from the source if omitted." },
+        folder_id: { type: "string", description: "ID of the Drive folder to upload into. Omit for root.", default: "root" }
       },
-      required: ["name"]
-    }
-  },
-  {
-    name: "drive_upload_part",
-    description: "Upload a base64 chunk for an in-progress chunked upload. Call multiple times in order. Each chunk should be up to 200KB of base64 text.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        upload_id: { type: "string", description: "The upload_id from drive_upload_start." },
-        part_number: { type: "number", description: "Sequential part number starting at 1." },
-        content: { type: "string", description: "Base64-encoded chunk of the file." }
-      },
-      required: ["upload_id", "part_number", "content"]
-    }
-  },
-  {
-    name: "drive_upload_complete",
-    description: "Complete a chunked upload. Assembles all parts and uploads the file to Google Drive.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        upload_id: { type: "string", description: "The upload_id from drive_upload_start." },
-        total_parts: { type: "number", description: "Total number of parts uploaded." }
-      },
-      required: ["upload_id", "total_parts"]
+      required: ["url", "name"]
     }
   },
   {
@@ -375,69 +351,47 @@ async function handleTool(name, args, env) {
       });
       return await res.json();
     }
-    case "drive_upload_start": {
-      const uploadId = "upload_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
-      const meta = {
-        name: args.name,
-        mime_type: args.mime_type || "application/octet-stream",
-        folder_id: args.folder_id || "root",
-        created: Date.now(),
-        parts: 0
-      };
-      await env.GOOGLE_TOKENS.put(`chunked:${uploadId}:meta`, JSON.stringify(meta), { expirationTtl: 3600 });
-      return { upload_id: uploadId, status: "ready", message: "Upload initialized. Send chunks with drive_upload_part, then call drive_upload_complete." };
-    }
-    case "drive_upload_part": {
-      const metaRaw = await env.GOOGLE_TOKENS.get(`chunked:${args.upload_id}:meta`);
-      if (!metaRaw) throw new Error("Upload not found or expired. Start a new upload with drive_upload_start.");
-      const meta = JSON.parse(metaRaw);
-      await env.GOOGLE_TOKENS.put(`chunked:${args.upload_id}:part_${args.part_number}`, args.content, { expirationTtl: 3600 });
-      meta.parts = Math.max(meta.parts, args.part_number);
-      await env.GOOGLE_TOKENS.put(`chunked:${args.upload_id}:meta`, JSON.stringify(meta), { expirationTtl: 3600 });
-      return { upload_id: args.upload_id, part_number: args.part_number, status: "stored", total_parts_so_far: meta.parts };
-    }
-    case "drive_upload_complete": {
-      const metaRaw = await env.GOOGLE_TOKENS.get(`chunked:${args.upload_id}:meta`);
-      if (!metaRaw) throw new Error("Upload not found or expired.");
-      const meta = JSON.parse(metaRaw);
-      let allBase64 = "";
-      for (let i = 1; i <= args.total_parts; i++) {
-        const chunk = await env.GOOGLE_TOKENS.get(`chunked:${args.upload_id}:part_${i}`);
-        if (!chunk) throw new Error(`Missing part ${i}. Upload all parts before completing.`);
-        allBase64 += chunk;
+    case "drive_upload_file": {
+      // Step 1: Fetch the file from the source URL (server-side, no base64)
+      var fileRes = await fetch(args.url);
+      if (!fileRes.ok) {
+        return { _error: true, status: fileRes.status, body: "Failed to fetch file from URL: " + fileRes.statusText };
       }
-      const binaryString = atob(allBase64);
-      const fileBytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) fileBytes[i] = binaryString.charCodeAt(i);
-      const boundary = "mcp_boundary_" + Date.now();
-      const metadata = JSON.stringify({ name: meta.name, parents: [meta.folder_id] });
-      const mimeType = meta.mime_type;
-      const partStrings = [
-        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n`,
-        `--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`
-      ];
-      const prefix = new TextEncoder().encode(partStrings[0] + partStrings[1]);
-      const suffix = new TextEncoder().encode(`\r\n--${boundary}--`);
-      const body = new Uint8Array(prefix.length + fileBytes.length + suffix.length);
-      body.set(prefix, 0);
-      body.set(fileBytes, prefix.length);
-      body.set(suffix, prefix.length + fileBytes.length);
-      const token = await refreshAccessToken(env);
-      const res = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,webViewLink,size", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": `multipart/related; boundary=${boundary}`
-        },
-        body: body
-      });
-      const result = await res.json();
-      // Clean up KV
-      await env.GOOGLE_TOKENS.delete(`chunked:${args.upload_id}:meta`);
-      for (let i = 1; i <= args.total_parts; i++) {
-        await env.GOOGLE_TOKENS.delete(`chunked:${args.upload_id}:part_${i}`);
-      }
-      return { ...result, upload_id: args.upload_id, status: "complete", parts_assembled: args.total_parts };
+      var fileBuffer = await fileRes.arrayBuffer();
+      var mimeType = args.mime_type || fileRes.headers.get("content-type") || "application/octet-stream";
+
+      // Step 2: Build multipart upload body
+      var metadata = { name: args.name };
+      metadata.parents = [args.folder_id || "root"];
+      var boundary = "mcp_upload_" + Date.now();
+      var encoder = new TextEncoder();
+      var metaJson = JSON.stringify(metadata);
+      var preamble = encoder.encode(
+        "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + metaJson + "\r\n--" + boundary + "\r\nContent-Type: " + mimeType + "\r\n\r\n"
+      );
+      var postamble = encoder.encode("\r\n--" + boundary + "--");
+      var body = new Uint8Array(preamble.length + fileBuffer.byteLength + postamble.length);
+      body.set(preamble, 0);
+      body.set(new Uint8Array(fileBuffer), preamble.length);
+      body.set(postamble, preamble.length + fileBuffer.byteLength);
+
+      // Step 3: Upload to Google Drive using multipart upload API
+      var token = await refreshAccessToken(env);
+      var uploadRes = await fetch(
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,size",
+        {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer " + token,
+            "Content-Type": "multipart/related; boundary=" + boundary,
+          },
+          body: body,
+        }
+      );
+      var uploadText = await uploadRes.text();
+      if (!uploadRes.ok) return { _error: true, status: uploadRes.status, body: uploadText };
+      var result = JSON.parse(uploadText);
+      return { uploaded: true, id: result.id, name: result.name, url: result.webViewLink, size: result.size };
     }
     case "drive_update": {
       const boundary = "mcp_boundary_" + Date.now();
@@ -542,7 +496,7 @@ async function handleMCP(request, env) {
     case "initialize":
       return jsonRPC(id, {
         protocolVersion: "2024-11-05",
-        serverInfo: { name: "google-drive-personal-mcp", version: "1.0.0" },
+        serverInfo: { name: "google-drive-personal-mcp", version: "1.1.0" },
         capabilities: { tools: { listChanged: false } }
       });
     case "notifications/initialized":
