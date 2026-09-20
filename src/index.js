@@ -66,7 +66,7 @@ const TOOLS = [
   },
   {
     name: "drive_upload",
-    description: "Upload a file to Google Drive. Provide content as base64 or plain text.",
+    description: "Upload a new file to Google Drive. Provide content as base64 or plain text.",
     inputSchema: {
       type: "object",
       properties: {
@@ -77,6 +77,32 @@ const TOOLS = [
         folder_id: { type: "string", description: "Target folder ID. Omit for root.", default: "root" }
       },
       required: ["name", "content"]
+    }
+  },
+  {
+    name: "drive_update",
+    description: "Update/replace the content of an existing file by ID. Does not change the file name or location.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "The Drive file ID to update." },
+        content: { type: "string", description: "New file content — plain text or base64-encoded binary." },
+        mime_type: { type: "string", description: "MIME type of the new content.", default: "text/plain" },
+        is_base64: { type: "boolean", description: "Set true if content is base64-encoded.", default: false }
+      },
+      required: ["file_id", "content"]
+    }
+  },
+  {
+    name: "drive_rename",
+    description: "Rename a file or folder.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "File or folder ID to rename." },
+        new_name: { type: "string", description: "The new name for the file or folder." }
+      },
+      required: ["file_id", "new_name"]
     }
   },
   {
@@ -94,6 +120,29 @@ const TOOLS = [
     }
   },
   {
+    name: "drive_list_permissions",
+    description: "List all permissions (who has access) on a file or folder.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "File or folder ID." }
+      },
+      required: ["file_id"]
+    }
+  },
+  {
+    name: "drive_remove_permission",
+    description: "Remove a specific permission from a file or folder. Use drive_list_permissions to get permission IDs first.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "File or folder ID." },
+        permission_id: { type: "string", description: "The permission ID to remove." }
+      },
+      required: ["file_id", "permission_id"]
+    }
+  },
+  {
     name: "drive_delete",
     description: "Move a file or folder to the trash (recoverable) or permanently delete it.",
     inputSchema: {
@@ -101,6 +150,17 @@ const TOOLS = [
       properties: {
         file_id: { type: "string", description: "File or folder ID." },
         permanent: { type: "boolean", description: "If true, permanently delete instead of trashing.", default: false }
+      },
+      required: ["file_id"]
+    }
+  },
+  {
+    name: "drive_untrash",
+    description: "Restore a file or folder from the trash.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "File or folder ID to restore." }
       },
       required: ["file_id"]
     }
@@ -277,6 +337,45 @@ async function handleTool(name, args, env) {
       });
       return await res.json();
     }
+    case "drive_update": {
+      const boundary = "mcp_boundary_" + Date.now();
+      const metadata = JSON.stringify({});
+      let fileBytes;
+      if (args.is_base64) {
+        const binaryString = atob(args.content);
+        fileBytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) fileBytes[i] = binaryString.charCodeAt(i);
+      } else {
+        fileBytes = new TextEncoder().encode(args.content);
+      }
+      const mimeType = args.mime_type || "text/plain";
+      const parts = [
+        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n`,
+        `--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`
+      ];
+      const prefix = new TextEncoder().encode(parts[0] + parts[1]);
+      const suffix = new TextEncoder().encode(`\r\n--${boundary}--`);
+      const body = new Uint8Array(prefix.length + fileBytes.length + suffix.length);
+      body.set(prefix, 0);
+      body.set(fileBytes, prefix.length);
+      body.set(suffix, prefix.length + fileBytes.length);
+      const token = await refreshAccessToken(env);
+      const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(args.file_id)}?uploadType=multipart&fields=id,name,mimeType,webViewLink,modifiedTime`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": `multipart/related; boundary=${boundary}`
+        },
+        body: body
+      });
+      return await res.json();
+    }
+    case "drive_rename": {
+      return await driveAPI(env, `/drive/v3/files/${encodeURIComponent(args.file_id)}?fields=id,name,mimeType`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: args.new_name })
+      });
+    }
     case "drive_share": {
       const permission = {
         role: args.role || "reader",
@@ -288,6 +387,14 @@ async function handleTool(name, args, env) {
         body: JSON.stringify(permission)
       });
     }
+    case "drive_list_permissions": {
+      return await driveAPI(env, `/drive/v3/files/${encodeURIComponent(args.file_id)}/permissions?fields=permissions(id,type,role,emailAddress,displayName,domain)`);
+    }
+    case "drive_remove_permission": {
+      return await driveAPI(env, `/drive/v3/files/${encodeURIComponent(args.file_id)}/permissions/${encodeURIComponent(args.permission_id)}`, {
+        method: "DELETE"
+      });
+    }
     case "drive_delete": {
       if (args.permanent) {
         return await driveAPI(env, `/drive/v3/files/${encodeURIComponent(args.file_id)}`, { method: "DELETE" });
@@ -297,6 +404,12 @@ async function handleTool(name, args, env) {
           body: JSON.stringify({ trashed: true })
         });
       }
+    }
+    case "drive_untrash": {
+      return await driveAPI(env, `/drive/v3/files/${encodeURIComponent(args.file_id)}?fields=id,name,mimeType,parents`, {
+        method: "PATCH",
+        body: JSON.stringify({ trashed: false })
+      });
     }
     case "drive_move": {
       const meta = await driveAPI(env, `/drive/v3/files/${encodeURIComponent(args.file_id)}?fields=parents`);
