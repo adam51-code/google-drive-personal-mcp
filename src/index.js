@@ -94,6 +94,19 @@ const TOOLS = [
     }
   },
   {
+    name: "drive_upload_image_as_pdf",
+    description: "Upload an image (JPEG) to Google Drive as a PDF. Fetches the image from a URL, converts it to a properly formatted PDF server-side, and uploads to Drive. Perfect for photos of documents, receipts, letters, etc.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "Public URL of the image to fetch (e.g. a ClickUp attachment URL)." },
+        name: { type: "string", description: "Filename for the PDF in Drive (must end in .pdf, e.g. 'COBRA Letter - Sep 2026.pdf')." },
+        folder_id: { type: "string", description: "ID of the Drive folder to upload into. Omit for root.", default: "root" }
+      },
+      required: ["url", "name"]
+    }
+  },
+  {
     name: "drive_update",
     description: "Update/replace the content of an existing file by ID. Does not change the file name or location.",
     inputSchema: {
@@ -352,46 +365,102 @@ async function handleTool(name, args, env) {
       return await res.json();
     }
     case "drive_upload_file": {
-      // Step 1: Fetch the file from the source URL (server-side, no base64)
       var fileRes = await fetch(args.url);
       if (!fileRes.ok) {
         return { _error: true, status: fileRes.status, body: "Failed to fetch file from URL: " + fileRes.statusText };
       }
       var fileBuffer = await fileRes.arrayBuffer();
       var mimeType = args.mime_type || fileRes.headers.get("content-type") || "application/octet-stream";
-
-      // Step 2: Build multipart upload body
       var metadata = { name: args.name };
       metadata.parents = [args.folder_id || "root"];
       var boundary = "mcp_upload_" + Date.now();
       var encoder = new TextEncoder();
       var metaJson = JSON.stringify(metadata);
-      var preamble = encoder.encode(
-        "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + metaJson + "\r\n--" + boundary + "\r\nContent-Type: " + mimeType + "\r\n\r\n"
-      );
+      var preamble = encoder.encode("--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + metaJson + "\r\n--" + boundary + "\r\nContent-Type: " + mimeType + "\r\n\r\n");
       var postamble = encoder.encode("\r\n--" + boundary + "--");
       var body = new Uint8Array(preamble.length + fileBuffer.byteLength + postamble.length);
       body.set(preamble, 0);
       body.set(new Uint8Array(fileBuffer), preamble.length);
       body.set(postamble, preamble.length + fileBuffer.byteLength);
-
-      // Step 3: Upload to Google Drive using multipart upload API
       var token = await refreshAccessToken(env);
-      var uploadRes = await fetch(
-        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,size",
-        {
-          method: "POST",
-          headers: {
-            Authorization: "Bearer " + token,
-            "Content-Type": "multipart/related; boundary=" + boundary,
-          },
-          body: body,
-        }
-      );
+      var uploadRes = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,size", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + token, "Content-Type": "multipart/related; boundary=" + boundary },
+        body: body
+      });
       var uploadText = await uploadRes.text();
       if (!uploadRes.ok) return { _error: true, status: uploadRes.status, body: uploadText };
       var result = JSON.parse(uploadText);
       return { uploaded: true, id: result.id, name: result.name, url: result.webViewLink, size: result.size };
+    }
+    case "drive_upload_image_as_pdf": {
+      var imgRes = await fetch(args.url);
+      if (!imgRes.ok) return { _error: true, status: imgRes.status, body: "Failed to fetch image: " + imgRes.statusText };
+      var imgBytes = new Uint8Array(await imgRes.arrayBuffer());
+      var contentType = imgRes.headers.get("content-type") || "";
+      var isJpeg = contentType.includes("jpeg") || contentType.includes("jpg") || imgBytes[0] === 0xFF;
+      if (!isJpeg) return { _error: true, body: "Unsupported image type: " + contentType + ". Only JPEG images are supported. Use drive_upload_file for other formats." };
+      var imgWidth = 0, imgHeight = 0;
+      var idx = 2;
+      while (idx < imgBytes.length - 1) {
+        if (imgBytes[idx] !== 0xFF) break;
+        var marker = imgBytes[idx + 1];
+        if (marker === 0xC0 || marker === 0xC1 || marker === 0xC2) {
+          imgHeight = (imgBytes[idx + 5] << 8) | imgBytes[idx + 6];
+          imgWidth = (imgBytes[idx + 7] << 8) | imgBytes[idx + 8];
+          break;
+        }
+        var segLen = (imgBytes[idx + 2] << 8) | imgBytes[idx + 3];
+        idx += 2 + segLen;
+      }
+      if (!imgWidth || !imgHeight) return { _error: true, body: "Could not determine image dimensions." };
+      var maxW = 572, maxH = 752;
+      var scale = Math.min(maxW / imgWidth, maxH / imgHeight, 1);
+      var pdfW = Math.round(imgWidth * scale);
+      var pdfH = Math.round(imgHeight * scale);
+      var pageW = pdfW + 40, pageH = pdfH + 40;
+      var enc = new TextEncoder();
+      var obj1 = "1 0 obj<</Type /Catalog /Pages 2 0 R>>endobj\n";
+      var obj2 = "2 0 obj<</Type /Pages /Kids [3 0 R] /Count 1>>endobj\n";
+      var obj3 = "3 0 obj<</Type /Page /Parent 2 0 R /MediaBox [0 0 " + pageW + " " + pageH + "] /Contents 4 0 R /Resources <</XObject <</Img 5 0 R>>>>>>endobj\n";
+      var streamContent = "q " + pdfW + " 0 0 " + pdfH + " 20 20 cm /Img Do Q";
+      var obj4 = "4 0 obj<</Length " + streamContent.length + ">>stream\n" + streamContent + "\nendstream\nendobj\n";
+      var obj5Header = "5 0 obj<</Type /XObject /Subtype /Image /Width " + imgWidth + " /Height " + imgHeight + " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length " + imgBytes.length + ">>stream\n";
+      var obj5Footer = "\nendstream\nendobj\n";
+      var hdr = "%PDF-1.4\n";
+      var hdrB = enc.encode(hdr);
+      var o1B = enc.encode(obj1), o2B = enc.encode(obj2), o3B = enc.encode(obj3), o4B = enc.encode(obj4);
+      var o5HB = enc.encode(obj5Header), o5FB = enc.encode(obj5Footer);
+      var off1 = hdrB.length, off2 = off1 + o1B.length, off3 = off2 + o2B.length, off4 = off3 + o3B.length, off5 = off4 + o4B.length;
+      var xrefStart = off5 + o5HB.length + imgBytes.length + o5FB.length;
+      function pad(n) { return String(n).padStart(10, "0"); }
+      var xref = "xref\n0 6\n0000000000 65535 f \n" + pad(off1) + " 00000 n \n" + pad(off2) + " 00000 n \n" + pad(off3) + " 00000 n \n" + pad(off4) + " 00000 n \n" + pad(off5) + " 00000 n \n";
+      var trailer = "trailer<</Size 6 /Root 1 0 R>>\nstartxref\n" + xrefStart + "\n%%EOF";
+      var xrefB = enc.encode(xref), trailerB = enc.encode(trailer);
+      var totalLen = hdrB.length + o1B.length + o2B.length + o3B.length + o4B.length + o5HB.length + imgBytes.length + o5FB.length + xrefB.length + trailerB.length;
+      var pdfBytes = new Uint8Array(totalLen);
+      var pos = 0;
+      function ap(a) { pdfBytes.set(a, pos); pos += a.length; }
+      ap(hdrB); ap(o1B); ap(o2B); ap(o3B); ap(o4B); ap(o5HB); ap(imgBytes); ap(o5FB); ap(xrefB); ap(trailerB);
+      var metadata = { name: args.name, parents: [args.folder_id || "root"] };
+      var boundary = "mcp_pdf_" + Date.now();
+      var metaJson = JSON.stringify(metadata);
+      var preamble = enc.encode("--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + metaJson + "\r\n--" + boundary + "\r\nContent-Type: application/pdf\r\n\r\n");
+      var postamble = enc.encode("\r\n--" + boundary + "--");
+      var body = new Uint8Array(preamble.length + pdfBytes.length + postamble.length);
+      body.set(preamble, 0);
+      body.set(pdfBytes, preamble.length);
+      body.set(postamble, preamble.length + pdfBytes.length);
+      var token = await refreshAccessToken(env);
+      var uploadRes = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,size", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + token, "Content-Type": "multipart/related; boundary=" + boundary },
+        body: body
+      });
+      var uploadText = await uploadRes.text();
+      if (!uploadRes.ok) return { _error: true, status: uploadRes.status, body: uploadText };
+      var result = JSON.parse(uploadText);
+      return { uploaded: true, format: "pdf", originalImageSize: imgBytes.length + " bytes", pdfSize: pdfBytes.length + " bytes", dimensions: imgWidth + "x" + imgHeight, id: result.id, name: result.name, url: result.webViewLink, size: result.size };
     }
     case "drive_update": {
       const boundary = "mcp_boundary_" + Date.now();
@@ -496,7 +565,7 @@ async function handleMCP(request, env) {
     case "initialize":
       return jsonRPC(id, {
         protocolVersion: "2024-11-05",
-        serverInfo: { name: "google-drive-personal-mcp", version: "1.1.0" },
+        serverInfo: { name: "google-drive-personal-mcp", version: "1.2.0" },
         capabilities: { tools: { listChanged: false } }
       });
     case "notifications/initialized":
