@@ -4,7 +4,7 @@ compatibility_date = "2026-09-20"
 
 [[kv_namespaces]]
 binding = "GOOGLE_TOKENS"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "322d31395dd84fbdbae1b3e2f6939574"
 
 [vars]
 GOOGLE_API_BASE = "https://www.googleapis.com"
